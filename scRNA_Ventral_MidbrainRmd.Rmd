@@ -1,0 +1,602 @@
+---
+title: "Single-Cell RNA-Seq Analysis of the Ventral Midbrain (mouse, P21)"
+subtitle: "PanglaoDB SRA667466 / SRS3059969 — 10x Chromium"
+author: "Giacomo Pogliana"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 9)
+```
+
+## 0. Introduction
+
+The sample analyzed comes from the ventral midbrain of mouse (CD-1 strain, female, postnatal day 21), sequenced with 10x Chromium and deposited in PanglaoDB under accession SRA667466 / SRS3059969 (original dataset: Zeisel et al., 2018, *Cell* 174, PMID 30096314).
+
+Before starting the analysis, it is worth building expectations. The ventral midbrain hosts the two main dopaminergic nuclei of the brain — the *substantia nigra pars compacta* (SNc) and the *ventral tegmental area* (VTA) — embedded in typical brain parenchyma. We therefore expect: dopaminergic neurons (markers *Th*, *Slc6a3*, *Slc18a2*), other neurons (GABAergic, glutamatergic), a substantial glial component (oligodendrocytes, astrocytes, microglia) and a vascular one (endothelium, pericytes/VLMC).
+
+One important detail: the sample is **P21, not adult**. At this age the mouse brain is still undergoing active myelination, so the entire oligodendrocyte maturation trajectory is expected to be present (from precursors to mature forms), not only fully mature oligodendrocytes as in an adult brain.
+
+```{r libraries}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+```
+
+## 1. Dataset loading
+
+```{r load-data}
+load('SRA667466_SRS3059969.sparse.RData')
+sm[1:5, 1:5]
+```
+
+The file downloaded from PanglaoDB in `.sparse.RData` format already contains the count matrix as a sparse object (`dgCMatrix`), ready to be passed to Seurat. Row names have the form `Symbol_ENSMUSGxxxxxxx.v`: we keep only the gene symbol, which is the one useful for biological annotation.
+
+```{r clean-gene-names}
+# Remove the Ensembl ID after the gene symbol
+sm@Dimnames[[1]] <- sub("_[^_]*$", "", sm@Dimnames[[1]])
+sm[1:5, 1:5]
+
+genenames <- rownames(sm)
+# Removing the ID can create duplicates: make.names enforces uniqueness
+rownames(sm) <- make.names(genenames, unique = TRUE)
+```
+
+## 2. Seurat object creation
+
+```{r create-seurat}
+vm <- CreateSeuratObject(counts = sm, project = "Ventral-midbrain",
+                          min.cells = 3, min.features = 200)
+vm
+head(colnames(vm))
+head(rownames(vm))
+```
+
+`CreateSeuratObject()` applies a first cross filter: `min.cells = 3` discards **genes** detected in fewer than 3 cells (technical noise), `min.features = 200` discards **cells** with fewer than 200 expressed genes — this removes the vast majority of empty droplets present in the raw matrix.
+
+## 3. Quality control
+
+The three classic QC parameters are: `nFeature_RNA` (unique genes per cell), `nCount_RNA` (total UMI molecules), and `percent.mt` (percentage of mitochondrial RNA).
+
+**Note on mouse nomenclature**: in mouse, mitochondrial genes are written `mt-Nd1`, `mt-Co1`, etc. (lowercase + hyphen), not `MT-` as in human. After `make.names()` the hyphen becomes a dot (`mt.Nd1`), so the correct pattern is `"^mt."`, not `"^mt-"`.
+
+```{r qc-metrics}
+# Mitochondrial
+grep("^mt.", rownames(vm), value = TRUE)
+vm[["percent.mt"]] <- PercentageFeatureSet(vm, pattern = "^mt.")
+
+# Ribosomal (Rpl/Rps in mouse, not RPL/RPS)
+length(grep("^Rp[ls]", rownames(vm), value = TRUE))
+vm[["percent.rbp"]] <- PercentageFeatureSet(vm, pattern = "^Rp[ls]")
+
+head(vm@meta.data, 5)
+summary(vm@meta.data[, c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rbp")])
+```
+
+```{r qc-violin-pre, fig.height=5}
+VlnPlot(vm, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rbp"),
+        ncol = 4, pt.size = 0) &
+  geom_boxplot(width = 0.15, fill = "white", outlier.shape = NA, alpha = 0.7)
+```
+
+The initial violin plots show a clearly **bimodal** distribution for `nFeature_RNA` and `nCount_RNA`: a low bulge (200-500 genes) made of low-quality cells, and the main body of the distribution around 800-1200. This double peak guides the choice of the lower threshold.
+
+```{r qc-scatter, fig.height=4}
+plot1 <- FeatureScatter(vm, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + NoLegend()
+plot2 <- FeatureScatter(vm, feature1 = "nCount_RNA", feature2 = "percent.mt")   + NoLegend()
+plot3 <- FeatureScatter(vm, feature1 = "nCount_RNA", feature2 = "percent.rbp")  + NoLegend()
+plot1 + plot2 + plot3
+```
+
+The strong, expected correlation is the one between `nCount_RNA` and `nFeature_RNA`. The scatter with `percent.mt` shows a tail of cells with low depth and high mitochondrial percentage — damaged cells, which guide the upper threshold on `percent.mt`. `percent.rbp` shows no structured correlation with depth and is therefore never used as a filtering criterion, only as a descriptive parameter.
+
+### 3.1 Threshold choice and filtering
+
+Thresholds are not universal and should not be copied from the PBMC vignette (where they are `nFeature 200-2500` and `percent.mt < 5`): those values are calibrated on human blood, a different tissue. For mouse nervous tissue, thresholds must be read from the distributions observed above:
+
+- **`nFeature_RNA > 500`** — cuts exactly at the "neck" between the two peaks of the bimodal distribution, removing low-quality cells without affecting the main body of the distribution;
+- **`nFeature_RNA < 3500`** — removes the tail of possible doublets;
+- **`percent.mt < 5`** — cuts where the main body of the distribution ends, leaving out the tail of damaged cells identified in the scatter plot above.
+
+```{r filtering}
+n_cell_pre <- ncol(vm)
+n_cell_pre
+
+vm <- subset(vm, subset = nFeature_RNA > 500 &
+               nFeature_RNA < 3500 &
+               percent.mt < 5)
+
+n_cell_post <- ncol(vm)
+n_cell_post
+```
+
+With these thresholds we go from `r n_cell_pre` to **`r n_cell_post` cells**, values very close to those reported directly by PanglaoDB for this same sample (3028 cells) — good indirect confirmation that the chosen thresholds are reasonable.
+
+```{r qc-violin-post, fig.height=5}
+VlnPlot(vm, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rbp"),
+        ncol = 4, pt.size = 0)
+```
+
+After filtering, the distributions are clean and unimodal; in particular `percent.mt` is symmetric and centered around 2-3%, with the tail of damaged cells no longer present.
+
+## 4. Normalization
+
+```{r normalization}
+vm <- NormalizeData(vm, normalization.method = "LogNormalize", scale.factor = 10000)
+vm[["RNA"]]
+
+counts_matrix <- LayerData(vm, assay = "RNA", layer = "counts")
+data_matrix   <- LayerData(vm, assay = "RNA", layer = "data")
+```
+
+`LogNormalize` divides the counts of each cell by the cell's own total, multiplies by 10,000, and applies `ln(x+1)`. This corrects for individual sequencing depth, which would otherwise make a cell appear more "active" simply because it was sequenced more deeply.
+
+## 5. Exploring the most highly expressed genes
+
+```{r top-genes}
+gene_expression <- apply(LayerData(vm, assay = "RNA", layer = "data"), 1, mean)
+gene_expression <- sort(gene_expression, decreasing = TRUE)
+head(gene_expression, n = 50)
+```
+
+Purely exploratory step. At the top are `Malat1` (ubiquitous nuclear lncRNA), `Plp1` and `Mbp` (myelin genes — their position already indicates a strongly myelinated tissue), several ribosomal genes, and some mitochondrial ones.
+
+```{r dropout-check, fig.height=4}
+VlnPlot(vm, features = c("Malat1", "Actb"))
+```
+
+`Actb` is a housekeeping gene expected to be expressed in every cell, yet the violin plot shows a consistent bulge at zero: this is the classic example of **dropout**, an intrinsic limitation of the technology (not poor cell quality), and it justifies the use of non-parametric statistical tests later in the analysis.
+
+### 5.1 Cell cycle phase assignment
+
+Seurat's `cc.genes.updated.2019` contains cell-cycle marker gene lists **only for human**. For mouse, `cc.genes.mouse.RDS` was used instead (gene symbols already converted to mouse nomenclature).
+
+```{r cell-cycle}
+cc_genes_mouse <- readRDS("cc.genes.mouse.RDS")
+cc_genes_mouse
+
+vm <- CellCycleScoring(vm,
+                        s.features = cc_genes_mouse$s.genes,
+                        g2m.features = cc_genes_mouse$g2m.genes,
+                        set.ident = TRUE)
+
+head(vm[[]], 10)
+table(vm$Phase)
+```
+
+The three phases are distributed in an almost uniform way. S.Score/G2M.Score remain within roughly ±0.07 for most cells — values effectively compatible with noise around zero rather than widespread proliferation. Whether the cell cycle artificially drives the separation of cells on the PCA will still be checked before deciding whether to regress it out.
+
+## 6. Highly variable genes (HVG)
+
+```{r hvg}
+vm <- FindVariableFeatures(vm, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(vm), 10)
+top10
+top20 <- head(VariableFeatures(vm), 20)
+top20
+
+plot_var <- VariableFeaturePlot(vm)
+plot_var <- LabelPoints(plot = plot_var, points = top10, repel = TRUE,
+                         xnudge = 0, ynudge = 0)
+plot_var
+```
+
+The `vst` method selects the 2000 genes with the highest variance after correcting for the fact that highly expressed genes naturally have higher numerical variance. Among the most variable genes are `Slc6a3`, `Dlk1`, `Slc18a2` (dopaminergic signature), `Tph2` (serotonergic), `Cst3`, `Lyz2` (microglia/macrophages), `Apoe` (astrocytes) — the dataset already "declares itself" as ventral midbrain before clustering has even been performed.
+
+## 7. Scaling
+
+```{r scaling}
+all_genes <- rownames(vm)
+vm <- ScaleData(vm, features = all_genes)
+vm@assays$RNA
+
+head(LayerData(vm, assay = "RNA", layer = "scale.data")["Plp1", 1:20])
+```
+
+Scaling transforms the expression of each gene into a z-score across all cells. It is applied to all genes, but the PCA will only use the 2000 HVGs.
+
+## 8. Principal Component Analysis (PCA)
+
+```{r pca}
+vm <- RunPCA(vm, features = VariableFeatures(object = vm))
+print(vm[["pca"]], dims = 1:5, nfeatures = 8)
+VizDimLoadings(vm, dims = 1:2, reduction = "pca")
+
+DimPlot(vm, reduction = "pca", group.by = "Phase")
+```
+
+The loadings of the first components already separate the major tissue compartments: PC1 contrasts neuronal genes (`Snap25`, `Sncb`, `Syp`) against myelin genes (`Cldn11`, `Mbp`, `Mag`, `Mal`); PC2 further separates the myelin component from the endothelial one (`Cldn5`, `Flt1`).
+
+The three cell cycle phases are completely mixed on the PC1-PC2 projection: the cell cycle does not drive the separation of cells, so it was not necessary to regress out S.Score/G2M.Score during scaling.
+
+### 8.1 Choice of the number of principal components
+
+```{r elbow}
+ElbowPlot(vm, ndims = 50)
+
+pc.touse <- (vm$pca@stdev)^2
+pc.touse <- pc.touse / sum(pc.touse)
+pc.touse <- cumsum(pc.touse)[1:50]
+cat("PCs for 75% of variance:", min(which(pc.touse >= 0.75)), "\n")
+cat("PCs for 80% of variance:", min(which(pc.touse >= 0.80)), "\n")
+```
+
+The Elbow Plot shows a clear elbow around PC 7-8, followed by a more gradual plateau up to roughly PC 15-20. The 75% cumulative variance rule returns **15 components**, consistent with visual inspection: the two criteria converge on the same value. 15 PCs are therefore adopted for clustering, UMAP, and t-SNE; 21 PCs (80% variance) is used later on as a robustness check.
+
+## 9. Clustering
+
+Seurat builds a K-nearest-neighbor graph in the space of the chosen PCs (`FindNeighbors`) and applies the Louvain algorithm to optimize modularity (`FindClusters`). The `resolution` parameter controls granularity: there is no a priori "correct" value — it must be chosen by comparing several resolutions.
+
+```{r clustering-05}
+vm_15pc_A <- FindNeighbors(vm, dims = 1:15)
+vm_15pc_05 <- FindClusters(vm_15pc_A, resolution = 0.5)
+vm_15pc_05 <- RunUMAP(vm_15pc_05, dims = 1:15)
+vm_15pc_05 <- RunTSNE(vm_15pc_05, dims = 1:15)
+
+plot_umap_A <- DimPlot(vm_15pc_05, reduction = "umap", label = TRUE) +
+  ggtitle("UMAP (15 PC, Res 0.5)") + NoLegend()
+plot_tsne_A <- DimPlot(vm_15pc_05, reduction = "tsne", label = TRUE) +
+  ggtitle("t-SNE (15 PC, Res 0.5)") + NoLegend()
+plot_umap_A + plot_tsne_A
+```
+
+```{r clustering-09}
+vm_15pc_A1 <- FindNeighbors(vm, dims = 1:15)
+vm_15pc_09 <- FindClusters(vm_15pc_A1, resolution = 0.9)
+vm_15pc_09 <- RunUMAP(vm_15pc_09, dims = 1:15)
+vm_15pc_09 <- RunTSNE(vm_15pc_09, dims = 1:15)
+
+plot_umap_A1 <- DimPlot(vm_15pc_09, reduction = "umap", label = TRUE) +
+  ggtitle("UMAP (15 PC, Res 0.9)") + NoLegend()
+plot_tsne_A1 <- DimPlot(vm_15pc_09, reduction = "tsne", label = TRUE) +
+  ggtitle("t-SNE (15 PC, Res 0.9)") + NoLegend()
+plot_umap_A1 + plot_tsne_A1
+```
+
+```{r clustering-04}
+vm_15pc_A2 <- FindNeighbors(vm, dims = 1:15)
+vm_15pc_04 <- FindClusters(vm_15pc_A2, resolution = 0.4)
+vm_15pc_04 <- RunUMAP(vm_15pc_04, dims = 1:15)
+vm_15pc_04 <- RunTSNE(vm_15pc_04, dims = 1:15)
+
+plot_umap_A2 <- DimPlot(vm_15pc_04, reduction = "umap", label = TRUE) +
+  ggtitle("UMAP (15 PC, Res 0.4)") + NoLegend()
+plot_tsne_A2 <- DimPlot(vm_15pc_04, reduction = "tsne", label = TRUE) +
+  ggtitle("t-SNE (15 PC, Res 0.4)") + NoLegend()
+plot_umap_A2 + plot_tsne_A2
+```
+
+```{r clustering-compare, fig.height=12}
+(plot_umap_A2 | plot_tsne_A2) /
+  (plot_umap_A  | plot_tsne_A)  /
+  (plot_umap_A1 | plot_tsne_A1)
+```
+
+**Resolution choice: 0.5.** Resolutions 0.4 and 0.5 produce the same number of clusters (13) with an equivalent structure on UMAP/t-SNE, indicating a stable solution in that range. Resolution 0.9 further fragments the oligodendrocyte and precursor compartment, without this additional fragmentation being supported by clean, exclusive markers in the pairwise comparisons (see Section 14). The number of clusters at resolution 0.5 (13) is also consistent with the 12 clusters reported directly by PanglaoDB.
+
+```{r robustness-21pc}
+# Robustness check: does clustering change substantially
+# when increasing the number of PCs beyond the chosen threshold (15)?
+vm_21pc <- FindNeighbors(vm, dims = 1:21)
+vm_21pc_05 <- FindClusters(vm_21pc, resolution = 0.5)
+vm_21pc_05 <- RunUMAP(vm_21pc_05, dims = 1:21)
+
+DimPlot(vm_21pc_05, reduction = "umap", label = TRUE) +
+  ggtitle("UMAP (21 PC, Res 0.5)") + NoLegend()
+
+table(Idents(vm_21pc_05))
+
+plot_umap_15 <- DimPlot(vm_15pc_05, reduction = "umap", label = TRUE) +
+  ggtitle("UMAP (15 PC, Res 0.5)") + NoLegend()
+plot_umap_21 <- DimPlot(vm_21pc_05, reduction = "umap", label = TRUE) +
+  ggtitle("UMAP (21 PC, Res 0.5)") + NoLegend()
+
+plot_umap_15 + plot_umap_21
+```
+
+The overall structure does not change substantially when moving from 15 to 21 PCs: this confirms that beyond PC 15 the additional components mostly capture technical noise rather than biological structure. The 15 PC / resolution 0.5 solution is therefore retained as the reference for all downstream analyses.
+
+```{r cluster-sizes}
+table(Idents(vm_15pc_05))
+head(Idents(vm_15pc_05), 5)
+head(vm_15pc_05@meta.data, 5)
+```
+
+```{r pca-clusters}
+DimPlot(vm_15pc_05, reduction = "pca") +
+  ggtitle("Clusters projected on PC1 and PC2")
+```
+
+Clusters appear heavily overlapping when projected only on PC1-PC2: clustering was computed on the full 15-dimensional space, and projecting onto just two components inevitably loses most of the discriminative information. This is precisely why UMAP and t-SNE — non-linear algorithms designed to preserve local structure — are preferred for the final visualization of clusters.
+
+## 10. Cluster validation
+
+Before proceeding to biological annotation, it is necessary to verify that the clusters found reflect real biological differences and not simply technical artifacts (sequencing depth, mitochondrial contamination, cell cycle phase).
+
+```{r validation-featureplot, fig.height=8}
+FeaturePlot(vm_15pc_05,
+            features = c("nCount_RNA", "nFeature_RNA", "percent.mt", "S.Score"),
+            ncol = 2, pt.size = 0.5, order = TRUE)
+```
+
+```{r validation-violin, fig.height=8}
+plot_vln_counts   <- VlnPlot(vm_15pc_05, features = "nCount_RNA",   pt.size = 0) + NoLegend()
+plot_vln_features <- VlnPlot(vm_15pc_05, features = "nFeature_RNA", pt.size = 0) + NoLegend()
+plot_vln_mt       <- VlnPlot(vm_15pc_05, features = "percent.mt",   pt.size = 0) + NoLegend()
+plot_vln_rbp      <- VlnPlot(vm_15pc_05, features = "percent.rbp",  pt.size = 0) + NoLegend()
+
+(plot_vln_counts | plot_vln_features) / (plot_vln_mt | plot_vln_rbp)
+```
+
+Clusters differ noticeably in `nCount_RNA`/`nFeature_RNA` (neuronal clusters in particular have much higher values than others), but this is an expected **biological** property — neurons are large, transcriptionally very active cells — not a technical artifact. `percent.mt` is instead homogeneous across all clusters, which rules out the presence of clusters made up of damaged cells that escaped the initial QC.
+
+```{r validation-cellcycle, fig.height=5}
+vm_15pc_05@meta.data %>%
+  group_by(seurat_clusters, Phase) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x = seurat_clusters, y = percent, fill = Phase)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Percentage Distribution of Cell Cycle Phases per Cluster",
+       x = "Cluster", y = "Percentage (%) of Cells", fill = "Phase")
+```
+
+Even at the individual-cluster level, the distribution of cell cycle phases remains nearly uniform across all 13 clusters, with no cluster dominated by a single phase. This confirms again that the cell cycle is not a confounding factor in cluster definition.
+
+## 11. Marker gene identification
+
+```{r find-markers}
+all_cluster_markers <- FindAllMarkers(vm_15pc_05, only.pos = TRUE,
+                                       min.pct = 0.25, logfc.threshold = 0.25)
+
+top10_by_logfc <- all_cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC, with_ties = TRUE)
+print(top10_by_logfc, n = 200)
+
+top2_by_pvalue <- all_cluster_markers %>%
+  group_by(cluster) %>%
+  slice_min(n = 2, order_by = p_val_adj)
+print(top2_by_pvalue)
+```
+
+For 10x data, the non-parametric **Wilcoxon** test is used (the `FindAllMarkers` default), a necessary choice given the sparse, non-Gaussian nature of the data (dropout, Section 5). `min.pct = 0.25` and `logfc.threshold = 0.25` restrict the comparison to reasonably expressed genes with a non-negligible minimum difference.
+
+Ranking by FDR instead of logFC often returns genes that are statistically significant but poorly informative (e.g. ubiquitous ribosomal proteins), because with thousands of cells even minimal differences reach very high significance. Cell identity assignment is therefore always based on ranking by `avg_log2FC`, using a combined criterion: high logFC, high `pct.1`, and above all **low `pct.2`** — the latter is the most important parameter because it measures marker specificity.
+
+## 12. Marker visualization
+
+```{r broad-markers, fig.height=6}
+# Canonical markers, one gene per population (from the expected-marker table)
+broad_markers <- c(
+  "Aqp4",     # Astrocytes
+  "Opalin",   # Oligodendrocytes
+  "Gpr17",    # COPs
+  "Tmem119",  # Microglia
+  "Cldn5",    # Endothelial cells
+  "Th",       # Dopaminergic neurons
+  "Dcn",      # VLMCs
+  "Snap25",   # Neurons
+  "Pvalb"     # GABAergic neurons
+)
+
+FeaturePlot(vm_15pc_05, features = broad_markers, ncol = 3, pt.size = 0.2, order = TRUE)
+```
+
+This panel uses **canonical** markers, known from the literature independently of this experiment's data, and is best suited for an immediate read: each gene lights up sharply in one region of the UMAP, visually confirming the main identities.
+
+```{r oligo-trajectory, fig.height=4}
+# Oligodendrocyte compartment: detail of the maturation trajectory
+oligo_check <- c(
+  "Gpr17",    # COP / differentiation (Cluster 6)
+  "Aspa",     # mature myelin, pan-oligo (Cluster 0)
+  "Mal",      # compact myelin, pan-oligo (Cluster 0/2/3/7)
+  "Klk6",     # Cluster 2
+  "Opalin",   # Cluster 3
+  "Rras2"     # Cluster 7
+)
+
+FeaturePlot(vm_15pc_05, features = oligo_check, ncol = 3, pt.size = 0.3, order = TRUE)
+```
+
+The oligodendrocyte compartment deserves a dedicated panel because it spans five clusters (0, 2, 3, 6, 7): `Mal` and `Aspa` mark the entire family, while `Gpr17`, `Klk6`, `Opalin`, and `Rras2` mark specific sub-regions along the maturation trajectory.
+
+```{r opc-cop-gradient, fig.height=4}
+# OPC -> COP continuum within cluster 6 (exploratory)
+FeaturePlot(vm_15pc_05, features = c("Pdgfra", "Bmp4", "Gpr17"), ncol = 3, order = TRUE)
+```
+
+Cluster 6 is a single Louvain community, not two separate subpopulations. Within it, a **continuous expression gradient** is observed: `Pdgfra` (quiescent OPCs, a literature marker) is concentrated in a small pocket at one end of the trajectory, while `Gpr17` broadly covers the entire committed (COP) stage, and `Bmp4` marks the onset of differentiation very specifically (but rarely). Zeisel et al. (2018), the source paper of this very dataset, describe OPC and COP as stages of a continuum even in their much larger atlas (820 + 1074 cells versus the 159 in this cluster) — with a smaller dataset, it is expected that the continuum is not resolved into two distinct communities. The single label **COP** is therefore kept for cluster 6.
+
+```{r all-13-markers, fig.height=10}
+# One marker per cluster (all 13), final systematic check
+all_13_markers <- c(
+  "Aspa",     # 0
+  "Resp18",   # 1
+  "Klk6",     # 2
+  "Opalin",   # 3
+  "Cldn5",    # 4
+  "Aqp4",     # 5
+  "Gpr17",    # 6
+  "Rras2",    # 7
+  "P2ry12",   # 8
+  "Pf4",      # 9
+  "Pvalb",    # 10
+  "Th",       # 11
+  "Dcn"       # 12
+)
+
+FeaturePlot(vm_15pc_05, features = all_13_markers, ncol = 4, pt.size = 0.2, order = TRUE)
+```
+
+### 12.1 Checking uncertain identities
+
+**Cluster 1 — Plvap.** Among the top markers by logFC, cluster 1 shows `Plvap`, normally an endothelial marker. Before assigning a wrong identity based on the name alone, its actual expression was checked against an unambiguous endothelial marker (`Cldn5`) and a generic neuronal marker (`Snap25`):
+
+```{r plvap-check, fig.height=6}
+FeaturePlot(vm_15pc_05, features = c("Plvap", "Cldn5", "Snap25", "Htr2c"),
+            ncol = 2, order = TRUE)
+```
+
+`Plvap` lights up in the same region as `Snap25`, not `Cldn5`: in this dataset it behaves as a neuronal marker, not an endothelial one. Cluster 1 is therefore correctly neuronal.
+
+**Cluster 10 — GABAergic identity.** `Pvalb` is the marker chosen for visualization (highest pct.1 among the cluster's markers), but the overview table also lists the canonical GABA neurotransmitter markers:
+
+```{r gaba-check, fig.height=6}
+FeaturePlot(vm_15pc_05, features = c("Pvalb", "Gad1", "Gad2", "Slc32a1"), ncol = 2, order = TRUE)
+```
+
+## 13. Marker heatmap
+
+```{r heatmap, fig.height=10}
+top5 <- all_cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 5, order_by = avg_log2FC)
+DoHeatmap(vm_15pc_05, features = top5$gene) + NoLegend()
+
+top10 <- all_cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+DoHeatmap(vm_15pc_05, features = top10$gene) + NoLegend()
+```
+
+The heatmap visually confirms what emerged from the FeaturePlots: clusters 0, 2, and 3 share a common band at the top (pan-oligodendrocyte genes) but each is distinguished by exclusive bands further down — a pattern that requires direct comparisons to be interpreted correctly.
+
+## 14. Pairwise comparisons between similar clusters
+
+Several clusters share a "family" identity (5 oligodendrocyte clusters, 3 neuronal clusters) despite having common "family" markers in the one-vs-all list. To determine whether these are biologically distinct subtypes or simply over-clustering of the same population, the most similar cluster pairs are compared directly.
+
+### 14.1 Oligodendrocyte compartment
+
+```{r pairwise-02}
+m_02 <- FindMarkers(vm_15pc_05, ident.1 = 0, ident.2 = 2, min.pct = 0.25)
+cat("--- UP in cluster 0 ---\n")
+head(m_02[order(-m_02$avg_log2FC),], 10)
+cat("--- UP in cluster 2 ---\n")
+head(m_02[order(m_02$avg_log2FC),], 10)
+```
+
+The 0 vs 2 comparison is clear-cut: cluster 0 is characterized by `Hapln2`/`Ptgds`, cluster 2 by `Klk6` together with `S100b` and `Pmp22`. These are distinct populations.
+
+```{r pairwise-03}
+m_03 <- FindMarkers(vm_15pc_05, ident.1 = 0, ident.2 = 3, min.pct = 0.25)
+cat("--- UP in cluster 0 ---\n")
+head(m_03[order(-m_03$avg_log2FC),], 10)
+cat("--- UP in cluster 3 ---\n")
+head(m_03[order(m_03$avg_log2FC),], 10)
+```
+
+`Hapln2` characterizes cluster 0, `Ctps` and `Tmem141` characterize cluster 3. Distinct populations.
+
+```{r pairwise-67}
+m_67 <- FindMarkers(vm_15pc_05, ident.1 = 6, ident.2 = 7, min.pct = 0.25)
+cat("--- UP in cluster 6 (COP) ---\n")
+head(m_67[order(-m_67$avg_log2FC),], 10)
+cat("--- UP in cluster 7 (NFOL) ---\n")
+head(m_67[order(m_67$avg_log2FC),], 10)
+```
+
+`Bmp4` and `Neu4` characterize cluster 6 (COP), with `Bmp4` significantly upregulated relative to cluster 7 (logFC ≈ 5.8, pct.2 ≈ 0.02) — a rare but highly specific marker even when comparing adjacent stages of the trajectory. `Onecut2` and `Birc2` characterize cluster 7 (NFOL), with the same mirrored pattern.
+
+**Overall biological interpretation.** The five clusters (6→7→3→2→0) are not an over-clustering artifact, but recapitulate the oligodendrocyte maturation trajectory described in the literature for the murine CNS (Marques et al., *Science* 2016; Zeisel et al., *Cell* 2018): from committed precursors (COP, cluster 6, markers `Gpr17`/`Bmp4`/`Neu4`) to newly formed forms (NFOL, cluster 7, `Rras2`/`Onecut2`), myelinating forms (MFOL, cluster 3, `Ctps`/`Opalin`), up to two subpopulations of mature oligodendrocytes (MOL, cluster 2 Klk6+ and cluster 0 Hapln2+/Ptgds+). This heterogeneity is particularly expected in a P21 sample, an age at which myelination is in full swing.
+
+### 14.2 Neuronal compartment
+
+```{r pairwise-110}
+m_110 <- FindMarkers(vm_15pc_05, ident.1 = 1, ident.2 = 10, min.pct = 0.25)
+cat("--- UP in cluster 1 ---\n")
+head(m_110[order(-m_110$avg_log2FC),], 10)
+cat("--- UP in cluster 10 ---\n")
+head(m_110[order(m_110$avg_log2FC),], 10)
+```
+
+Cluster 1 is marked by `Vsnl1`, `Ctxn2`, `Scg2`, `Calb2` (pct.2 = 0 relative to cluster 10), while cluster 10 is marked by `Pvalb`, `Il22`, `Prkcd`, `Kit`. Clearly distinct populations.
+
+```{r pairwise-111}
+m_111 <- FindMarkers(vm_15pc_05, ident.1 = 1, ident.2 = 11, min.pct = 0.25)
+cat("--- UP in cluster 1 ---\n")
+head(m_111[order(-m_111$avg_log2FC),], 10)
+cat("--- UP in cluster 11 ---\n")
+head(m_111[order(m_111$avg_log2FC),], 10)
+```
+
+Cluster 11 is unambiguously marked by `Slc6a3`, `Th`, `Aldh1a1`, `Chrna6` (high pct.2 in cluster 1, virtually absent outside cluster 11). Worth noting: the genes apparently upregulated in cluster 1 in this comparison (`Gad1`, `Gad2`, `Slc17a6`, `Slc32a1`) have `p_val_adj` equal to 1 after multiple-testing correction, despite a low raw p-value — due to the small size of cluster 11 (23 cells), which strongly reduces statistical power. It is therefore not possible to confidently state that cluster 1 is a mixed GABAergic/glutamatergic population: the more cautious, statistically supported label "Neurons" is retained.
+
+## 15. Final annotation
+
+```{r annotation-check-levels}
+levels(vm_15pc_05)   # check the order before renaming!
+```
+
+```{r annotation-final}
+new.cluster.ids <- c(
+  "Mature oligodendrocytes (Ptgds+)",     # 0
+  "Neurons",                              # 1
+  "Mature oligodendrocytes (Klk6+)",      # 2
+  "Myelinating oligodendrocytes",         # 3
+  "Endothelial cells",                    # 4
+  "Astrocytes",                           # 5
+  "COPs",                                 # 6
+  "Newly formed oligodendrocytes",        # 7
+  "Microglia",                            # 8
+  "Macrophages",                          # 9
+  "GABAergic neurons",                    # 10
+  "Dopaminergic neurons",                 # 11
+  "VLMCs"                                 # 12
+)
+names(new.cluster.ids) <- levels(vm_15pc_05)
+vm_15pc_05 <- RenameIdents(vm_15pc_05, new.cluster.ids)
+vm_15pc_05$celltype <- Idents(vm_15pc_05)
+```
+
+**Important methodological note**: the `new.cluster.ids` vector must exactly match the order returned by `levels(vm_15pc_05)` (0, 1, 2, … 12). A reversed order would silently assign labels to the wrong clusters, without R throwing any error — which is why the `levels()` check must always be run immediately before `RenameIdents()`.
+
+The label **COPs** (committed oligodendrocyte precursors) for cluster 6, rather than the more generic "OPCs", reflects the marker actually dominant in the dataset (`Gpr17`/`Bmp4`, not `Pdgfra`) — consistent with the nomenclature of Marques et al. 2016 and with the source paper of the dataset itself (Zeisel et al. 2018), even though this represents a continuum rather than a sharply separated stage (Sections 12.1 / 14.1).
+
+```{r final-umap, fig.height=6}
+DimPlot(vm_15pc_05, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5) +
+  NoLegend() + ggtitle("Cell atlas of the ventral midbrain (P21)")
+```
+
+```{r final-dotplot, fig.width=10, fig.height=6}
+DotPlot(vm_15pc_05, features = c("Ptgds", "Klk6", "Ctps", "Onecut2", "Bmp4",
+                                  "Aqp4", "Cldn5", "Dcn", "P2ry12", "Pf4",
+                                  "Snap25", "Pvalb", "Th")) + RotatedAxis()
+```
+
+This DotPlot shows, for each population, the **most discriminating** marker found empirically (high logFC + low pct.2 criterion applied to `FindAllMarkers`), unlike the FeaturePlot in Section 12, which uses canonical markers from the literature. For the COPs, this criterion selects `Bmp4` rather than `Gpr17`: the dot is small (pct.1 = 25%, only a minority of cluster cells express it) but highly specific (pct.2 < 1%, virtually absent elsewhere) — also confirmed by the direct 6 vs 7 comparison (Section 14.1).
+
+```{r final-counts}
+sort(table(Idents(vm_15pc_05)), decreasing = TRUE)
+```
+
+## 16. Discussion of results
+
+The analysis identified **13 cell populations** in the mouse ventral midbrain at P21, in line with the biological expectations discussed in the introduction:
+
+- the **oligodendrocyte** compartment is the most represented (5 clusters, over 2000 cells total) and recapitulates the entire maturation trajectory, from committed precursors (COPs) to mature forms, as expected in a tissue still undergoing active myelination;
+- **dopaminergic neurons** (23 cells) are numerically rare but identified with the highest possible statistical confidence (`Th`, `Slc6a3` with pct.2 close to zero) — direct confirmation that the sample indeed originates from the ventral midbrain;
+- the remaining glial (astrocytes, microglia) and vascular (endothelium, perivascular macrophages, VLMCs) components are all present with clean, unambiguous canonical markers.
+
+### 16.1 Limitations of the analysis
+
+The under-representation of neurons relative to glia is a well-known technical bias of single-cell preparations: neurons, being large cells with extensive arborizations, are more fragile during enzymatic dissociation and are preferentially lost compared to more compact glial cells.
+
+Cluster 0 (mature oligodendrocytes) does not possess a strongly exclusive marker in the general one-vs-all analysis — its identity was defined only through direct comparisons with adjacent clusters (Section 14.1). This likely reflects a biological reality more than a limitation of the method: oligodendrocyte differentiation is a biologically continuous process, and the discretization into sharp clusters performed by clustering is an approximation of it.
+
+Similarly, cluster 6 (COPs) shows an internal continuous gradient between the OPC stage (Pdgfra+, a minority of cells) and the true committed stage (Gpr17+/Bmp4+, the majority), not resolved into two separate communities because of the cluster's limited size (159 cells) compared to what a larger dataset such as Zeisel et al. 2018 (820 OPCs + 1074 COPs) is able to discriminate.
+
+```{r session-info}
+sessionInfo()
+```
